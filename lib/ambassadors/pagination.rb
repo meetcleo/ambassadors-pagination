@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "forwardable"
+
 # Load only Kaminari's core - the view and ActiveRecord integrations are not
 # required here since this gem extends a collection, not an AR scope.
 require "kaminari/core"

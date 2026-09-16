@@ -5,19 +5,15 @@ module Ambassadors
     ##
     # A paginated extension of {::AmbassadorCollection} backed by Kaminari.
     #
-    # Applies a page window (limit + offset) directly to the underlying
-    # enumerable before records are loaded. For ActiveRecord::Relation
-    # enumerables the window is pushed down to SQL, so at most +per_page+
-    # rows are loaded per request. This preserves the load-limiting intent
-    # of the base collection.
+    # Builds a Kaminari-aware scope from the enumerable using +.page(n).per(m)+
+    # and delegates all pagination metadata to it. For ActiveRecord::Relation
+    # enumerables the window is pushed down to SQL (at most +per_page+ rows
+    # loaded per request). For plain enumerables, +Kaminari.paginate_array+
+    # is used.
     #
-    # Because Rails raises when +find_each+ is called on a scoped relation
-    # that already carries a +LIMIT+, this class always uses plain +each+
-    # iteration (via {Ambassadors::Iterators::Iterator}) after the window
-    # has been applied.
-    #
-    # Implements the interface expected by Kaminari's view helpers via
-    # +Kaminari::PageScopeMethods+.
+    # Because Rails raises when +find_each+ is called on a relation that already
+    # carries a +LIMIT+, this class always uses plain +each+ iteration
+    # (via {Ambassadors::Iterators::Iterator}) after the page window is applied.
     #
     # @example Basic usage
     #   collection = PaginatedAmbassadorCollection.new(
@@ -32,23 +28,37 @@ module Ambassadors
     # @example Chaining
     #   base = PaginatedAmbassadorCollection.new(User.all, ambassador_class: UserAmbassador)
     #   page_two = base.page(2).per(10)
+    #
+    # @example Class-level default page size
+    #   PaginatedAmbassadorCollection.paginates_per 15
     class PaginatedAmbassadorCollection < ::AmbassadorCollection
-      # Expose class-level DSL: paginates_per, max_paginates_per.
+      extend Forwardable
+
+      # Provides class-level DSL: +paginates_per+, +max_paginates_per+.
       include Kaminari::ConfigurationMethods
+
+      # Delegate Kaminari page-state methods to the underlying Kaminari scope.
+      # total_pages is intentionally excluded - see method definition below.
+      def_delegators :@kaminari_scope,
+                     :current_page, :total_count, :limit_value,
+                     :offset_value, :next_page, :prev_page,
+                     :first_page?, :last_page?, :out_of_range?
 
       ##
       # @param enumerable [Enumerable]
       # @param current_page [Integer] 1-based page number (defaults to 1)
-      # @param per_page [Integer] records per page (defaults to Kaminari default)
+      # @param per_page [Integer, nil] records per page (defaults to +paginates_per+ or Kaminari global default)
       # @param kwargs [Hash] forwarded to {::AmbassadorCollection}
-      def initialize(enumerable, current_page: 1, per_page: Kaminari.config.default_per_page, **kwargs)
+      def initialize(enumerable, current_page: 1, per_page: nil, **kwargs)
         @unscoped_enumerable = enumerable
-        @current_page_number = [current_page.to_i, 1].max
-        @per_page_size = per_page.to_i
         @collection_kwargs = kwargs
-
-        # Use plain each-iteration: find_each raises when a LIMIT is already present.
-        super(windowed_enumerable, iterator: Ambassadors::Iterators::Iterator, **kwargs)
+        @kaminari_scope = build_kaminari_scope(
+          enumerable,
+          current_page: current_page,
+          per_page: per_page || self.class.paginates_per
+        )
+        # find_each raises when a LIMIT is already present; use plain each instead.
+        super(@kaminari_scope, iterator: Ambassadors::Iterators::Iterator, **kwargs)
       end
 
       ##
@@ -56,12 +66,7 @@ module Ambassadors
       # @param number [Integer]
       # @return [PaginatedAmbassadorCollection]
       def page(number)
-        self.class.new(
-          @unscoped_enumerable,
-          current_page: number,
-          per_page: @per_page_size,
-          **@collection_kwargs
-        )
+        self.class.new(@unscoped_enumerable, current_page: number, per_page: limit_value, **@collection_kwargs)
       end
 
       ##
@@ -69,80 +74,14 @@ module Ambassadors
       # @param size [Integer]
       # @return [PaginatedAmbassadorCollection]
       def per(size)
-        self.class.new(
-          @unscoped_enumerable,
-          current_page: @current_page_number,
-          per_page: size,
-          **@collection_kwargs
-        )
+        self.class.new(@unscoped_enumerable, current_page: current_page, per_page: size, **@collection_kwargs)
       end
 
       ##
-      # The maximum number of records per page (satisfies Kaminari::PageScopeMethods).
-      # @return [Integer]
-      def limit_value
-        @per_page_size
-      end
-
-      ##
-      # The record offset for the current page (satisfies Kaminari::PageScopeMethods).
-      # @return [Integer]
-      def offset_value
-        (@current_page_number - 1) * @per_page_size
-      end
-
-      ##
-      # Total number of records across all pages. Issues a COUNT query for
-      # ActiveRecord::Relation enumerables - never loads records.
-      # @return [Integer]
-      def total_count
-        @unscoped_enumerable.count
-      end
-
-      ##
-      # The 1-based page number currently active.
-      # @return [Integer]
-      def current_page
-        @current_page_number
-      end
-
-      ##
-      # Total number of pages given the current per_page size.
+      # Total number of pages. Always returns at least 1, even for empty collections.
       # @return [Integer]
       def total_pages
-        return 1 if total_count.zero?
-
-        (total_count.to_f / limit_value).ceil
-      end
-
-      ##
-      # @return [Integer, nil] next page number, or nil when on the last page
-      def next_page
-        current_page + 1 unless last_page? || out_of_range?
-      end
-
-      ##
-      # @return [Integer, nil] previous page number, or nil when on the first page
-      def prev_page
-        current_page - 1 unless first_page? || out_of_range?
-      end
-
-      ##
-      # @return [Boolean]
-      def first_page?
-        current_page == 1
-      end
-
-      ##
-      # @return [Boolean]
-      def last_page?
-        current_page == total_pages
-      end
-
-      ##
-      # @return [Boolean]
-      def out_of_range?
-        current_page > total_pages
+        [@kaminari_scope.total_pages, 1].max
       end
 
       ##
@@ -159,12 +98,19 @@ module Ambassadors
 
       private
 
-      def windowed_enumerable
-        if defined?(ActiveRecord::Relation) && @unscoped_enumerable.is_a?(ActiveRecord::Relation)
-          @unscoped_enumerable.offset(offset_value).limit(limit_value)
+      ##
+      # @param enumerable [Enumerable]
+      # @param current_page [Integer]
+      # @param per_page [Integer]
+      # @return [ActiveRecord::Relation, Kaminari::PaginatableArray]
+      def build_kaminari_scope(enumerable, current_page:, per_page:)
+        scope = if defined?(ActiveRecord::Relation) && enumerable.is_a?(ActiveRecord::Relation)
+          enumerable
         else
-          Array(@unscoped_enumerable).slice(offset_value, limit_value) || []
+          Kaminari.paginate_array(Array(enumerable))
         end
+
+        scope.page(current_page).per(per_page)
       end
     end
   end
