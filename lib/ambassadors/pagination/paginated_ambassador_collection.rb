@@ -5,11 +5,10 @@ module Ambassadors
     ##
     # A paginated extension of {::AmbassadorCollection} backed by Kaminari.
     #
-    # Builds a Kaminari-aware scope from the enumerable using +.page(n).per(m)+
-    # and delegates all pagination metadata to it. For ActiveRecord::Relation
-    # enumerables the window is pushed down to SQL (at most +per_page+ rows
-    # loaded per request). For plain enumerables, +Kaminari.paginate_array+
-    # is used.
+    # Passes a Kaminari-aware scope as the enumerable to the parent collection
+    # and delegates pagination metadata directly to it. For ActiveRecord::Relation
+    # enumerables the page window is pushed down to SQL (at most +per_page+ rows
+    # loaded per request). For plain enumerables, +Kaminari.paginate_array+ is used.
     #
     # Because Rails raises when +find_each+ is called on a relation that already
     # carries a +LIMIT+, this class always uses plain +each+ iteration
@@ -37,9 +36,10 @@ module Ambassadors
       # Provides class-level DSL: +paginates_per+, +max_paginates_per+.
       include Kaminari::ConfigurationMethods
 
-      # Delegate Kaminari page-state methods to the underlying Kaminari scope.
-      # total_pages is intentionally excluded - see method definition below.
-      def_delegators :@kaminari_scope,
+      # @enumerable is set by the parent constructor to the Kaminari scope we pass in,
+      # so all pagination metadata can be read directly from it.
+      # total_pages is excluded - see method definition below.
+      def_delegators :@enumerable,
                      :current_page, :total_count, :limit_value,
                      :offset_value, :next_page, :prev_page,
                      :first_page?, :last_page?, :out_of_range?
@@ -52,13 +52,12 @@ module Ambassadors
       def initialize(enumerable, current_page: 1, per_page: nil, **kwargs)
         @unscoped_enumerable = enumerable
         @collection_kwargs = kwargs
-        @kaminari_scope = build_kaminari_scope(
-          enumerable,
-          current_page: current_page,
-          per_page: per_page || self.class.paginates_per
-        )
         # find_each raises when a LIMIT is already present; use plain each instead.
-        super(@kaminari_scope, iterator: Ambassadors::Iterators::Iterator, **kwargs)
+        super(
+          kaminari_scope(enumerable, current_page:, per_page: per_page || self.class.paginates_per),
+          iterator: Ambassadors::Iterators::Iterator,
+          **kwargs
+        )
       end
 
       ##
@@ -81,7 +80,7 @@ module Ambassadors
       # Total number of pages. Always returns at least 1, even for empty collections.
       # @return [Integer]
       def total_pages
-        [@kaminari_scope.total_pages, 1].max
+        [@enumerable.total_pages, 1].max
       end
 
       ##
@@ -103,7 +102,7 @@ module Ambassadors
       # @param current_page [Integer]
       # @param per_page [Integer]
       # @return [ActiveRecord::Relation, Kaminari::PaginatableArray]
-      def build_kaminari_scope(enumerable, current_page:, per_page:)
+      def kaminari_scope(enumerable, current_page:, per_page:)
         scope = if defined?(ActiveRecord::Relation) && enumerable.is_a?(ActiveRecord::Relation)
           enumerable
         else
